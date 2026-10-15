@@ -20,6 +20,7 @@ jobs:
   failover:
     runs-on: ubuntu-latest
     environment: failover
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:

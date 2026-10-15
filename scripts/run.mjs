@@ -15,19 +15,57 @@ function parseCurrent(raw) {
   }
 }
 
-async function requeue(client, now) {
+const RERUN_TRIES = 3;
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Cancel then re-run each stuck run. A failed re-run is retried with backoff; a run
+// that still fails is logged and counted. One repo erroring never skips the other.
+async function requeue(client, now, { sleep }) {
+  const failed = [];
+  const errs = [];
+  const warn = (m) => process.stderr.write(`${m}\n`);
+  let requeued = 0;
   for (const repo of REQUEUE_REPOS) {
-    const runs = (await client.listQueuedRuns(repo))
-      .filter((r) => now.getTime() - Date.parse(r.created_at) > MIN_AGE_MS)
-      .slice(0, CAP);
-    for (const r of runs) {
-      await client.cancelRun(repo, r.id);
-      await client.rerunRun(repo, r.id);
+    try {
+      const runs = (await client.listQueuedRuns(repo))
+        .filter((r) => now.getTime() - Date.parse(r.created_at) > MIN_AGE_MS)
+        .slice(0, CAP);
+      for (const r of runs) {
+        try {
+          await client.cancelRun(repo, r.id);
+        } catch (e) {
+          errs.push(e);
+          failed.push(`${repo}#${r.id}`);
+          warn(`requeue failed (cancel): ${repo} run ${r.id}`);
+          continue;
+        }
+        let ok = false;
+        let lastErr;
+        for (let i = 0; i < RERUN_TRIES && !ok; i++) {
+          if (i > 0) await sleep(2000 * 2 ** (i - 1));
+          try {
+            await client.rerunRun(repo, r.id);
+            ok = true;
+          } catch (e) { lastErr = e; }
+        }
+        if (ok) requeued++;
+        else {
+          errs.push(lastErr);
+          failed.push(`${repo}#${r.id}`);
+          warn(`requeue failed (rerun): ${repo} run ${r.id}`);
+        }
+      }
+    } catch (e) {
+      errs.push(e);
+      failed.push(`${repo}(list)`);
+      warn(`requeue failed (list): ${repo}`);
     }
   }
+  warn(`requeued=${requeued} failed=${failed.length}`);
+  return { failed, firstErr: errs[0] };
 }
 
-export async function evaluate({ client, dryRun = false, now = new Date(), log = console.log, captureError = defaultCapture }) {
+export async function evaluate({ client, dryRun = false, now = new Date(), log = console.log, captureError = defaultCapture, sleep = defaultSleep }) {
   let route = 'health-check';
   try {
     const [rawState, rawCurrent, runners] = await Promise.all([
@@ -60,18 +98,31 @@ export async function evaluate({ client, dryRun = false, now = new Date(), log =
       if (d.writeVar) await client.setOrgVariable('CI_RUNNER_JSON', d.writeVar);
       await writeState();
     }
-    if (d.alert) {
-      await client.postSlack(
-        d.decision === 'flip_hosted'
-          ? 'CI runners unhealthy: failed over to GitHub-hosted runners.'
-          : 'CI runners still unhealthy (reminder).',
-      );
-    }
-
+    // Re-queue before alerting so a Slack outage cannot skip it; surface failures at the end.
+    let failed = [];
+    let firstErr;
     if (online < 1 && (d.decision === 'flip_hosted' || current === 'ubuntu-latest')) {
       route = 'requeue';
-      await requeue(client, now);
+      ({ failed, firstErr } = await requeue(client, now, { sleep }));
+      if (!failed.length) route = 'health-check';
     }
+    let slackErr = null;
+    if (d.alert) {
+      try {
+        await client.postSlack(
+          d.decision === 'flip_hosted'
+            ? 'CI runners unhealthy: failed over to GitHub-hosted runners.'
+            : 'CI runners still unhealthy (reminder).',
+        );
+      } catch (e) {
+        slackErr = e;
+      }
+    }
+    if (failed.length) {
+      try { await client.postSlack(`ci-runner-health: ${failed.length} queued run(s) could not be re-queued: ${failed.join(', ')}`); } catch { /* best effort */ }
+      throw firstErr || new Error(`re-queue failed for ${failed.length} run(s)`);
+    }
+    if (slackErr) throw slackErr;
     return d;
   } catch (err) {
     if (!dryRun) {
@@ -96,6 +147,7 @@ function realClient(env) {
       method,
       headers: { ...headers, ...(body ? { 'Content-Type': 'application/json' } : {}) },
       body: body ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(15000),
     });
     if (!res.ok && !okCodes.includes(res.status)) throw new Error(`GitHub API ${method} failed: ${res.status}`);
     return res;
@@ -131,6 +183,7 @@ function realClient(env) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text }),
+        signal: AbortSignal.timeout(15000),
       });
       if (!res.ok) throw new Error(`Slack post failed: ${res.status}`);
     },
@@ -143,7 +196,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     dryRun: process.env.DRY_RUN === 'true',
     now: new Date(),
     log: (l) => process.stdout.write(`${l}\n`),
-  }).catch(() => {
+  }).catch((err) => {
+    process.stderr.write(`ci-runner-health failed: ${err && err.message}\n`);
     process.exitCode = 1;
   });
 }
