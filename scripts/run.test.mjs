@@ -157,3 +157,52 @@ test('step failure in re-queue is captured with route requeue', async () => {
   await assert.rejects(go(c, { captureError: async (e, o) => { captured.push(o.route); } }), /cancel failed/);
   assert.deepEqual(captured, ['requeue']);
 });
+
+test('flipped state but runners online (current=ubuntu-latest): no re-queue', async () => {
+  // healthy=0 -> this run is healthy (online=1) but not yet 3 healthy, so no flip_back; must not re-queue
+  const c = makeClient({
+    state: { ...ZERO, misses: 3, flipped: true, last_alert: minsAgo(30) }, current: '"ubuntu-latest"',
+    runners: [runner('a', 'online')], queued: { scheduler: [{ id: 9, created_at: minsAgo(20) }] },
+  });
+  await go(c);
+  assert.equal(of(c, 'cancelRun').length, 0);
+  assert.equal(of(c, 'rerunRun').length, 0);
+});
+
+test('1 miss on benjis-ci (no flip yet): old queued runs are not re-queued', async () => {
+  const c = makeClient({
+    state: ZERO, current: '"benjis-ci"', runners: [],
+    queued: { scheduler: [{ id: 9, created_at: minsAgo(20) }] },
+  });
+  await go(c);
+  assert.equal(of(c, 'setOrgVariable').length, 0);
+  assert.equal(of(c, 'cancelRun').length, 0);
+  assert.equal(of(c, 'rerunRun').length, 0);
+});
+
+test('flip_back: writes "benjis-ci" and persists flipped=false', async () => {
+  const c = makeClient({
+    state: { ...ZERO, healthy: 2, flipped: true, last_alert: minsAgo(30) }, current: '"ubuntu-latest"',
+    runners: [runner('a', 'online')],
+  });
+  const lines = await go(c);
+  assert.deepEqual(of(c, 'setOrgVariable'), [['setOrgVariable', 'CI_RUNNER_JSON', '"benjis-ci"']]);
+  const saved = JSON.parse(of(c, 'setRepoVariable').filter((w) => w[1] === 'HEALTH_STATE')[0][2]);
+  assert.equal(saved.flipped, false);
+  assert.ok(lines.includes('decision=flip_back'));
+});
+
+test('healthy fleet: no Slack post', async () => {
+  const c = makeClient({ runners: [runner('a', 'online')] });
+  await go(c);
+  assert.equal(of(c, 'postSlack').length, 0);
+});
+
+test('invalid HEALTH_STATE through evaluate: treated as cold start, no throw, state rewritten', async () => {
+  for (const bad of ['', '{"misses":"x"}']) {
+    const c = makeClient({ state: bad, runners: [runner('a', 'online')] });
+    const lines = await go(c);
+    assert.ok(lines.includes('online=1'));
+    assert.equal(of(c, 'setRepoVariable').filter((w) => w[1] === 'HEALTH_STATE').length, 1);
+  }
+});
