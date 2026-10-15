@@ -49,8 +49,17 @@ export async function evaluate({ client, dryRun = false, now = new Date(), log =
     log(`dry_run=${dryRun}`);
     if (dryRun) return d;
 
-    if (d.writeVar) await client.setOrgVariable('CI_RUNNER_JSON', d.writeVar);
-    await client.setRepoVariable('HEALTH_STATE', JSON.stringify(d.state));
+    // Order so a failure between the two writes stays retryable: flip_hosted records
+    // state (flipped=true) first; flip_back changes the org variable first, so state
+    // keeps flipped=true and the next cycle retries.
+    const writeState = () => client.setRepoVariable('HEALTH_STATE', JSON.stringify(d.state));
+    if (d.decision === 'flip_hosted') {
+      await writeState();
+      if (d.writeVar) await client.setOrgVariable('CI_RUNNER_JSON', d.writeVar);
+    } else {
+      if (d.writeVar) await client.setOrgVariable('CI_RUNNER_JSON', d.writeVar);
+      await writeState();
+    }
     if (d.alert) {
       await client.postSlack(
         d.decision === 'flip_hosted'
