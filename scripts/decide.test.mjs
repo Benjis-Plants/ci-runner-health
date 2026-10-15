@@ -51,6 +51,9 @@ test('(e) 3+ healthy, flipped=false, var ubuntu-latest -> no write', () => {
   assert.equal(r.state.healthy, 4);
 });
 
+// (f) resolution: rule 1 says healthy+1 on every healthy check, so decide() returns healthy=1.
+// Rule 5 ("cold start with healthy runners writes nothing") is enforced at the writer: evaluate.test.mjs
+// asserts no HEALTH_STATE write on cold start.
 test('(f) cold start (state null), healthy runners -> no actions, state unchanged-equivalent', () => {
   const r = decide({ state: null, online: 2, currentVar: null, now: NOW });
   assert.deepEqual(r.actions, []);
@@ -111,3 +114,17 @@ test('(j) countOnline: benjis-ci but offline = 0', () => assert.equal(countOnlin
 test('(j) countOnline: online without the label = 0', () => assert.equal(countOnline([R('online', 'self-hosted', 'linux')]), 0));
 test('(j) countOnline: counts only online+labelled', () =>
   assert.equal(countOnline([R('online', 'benjis-ci'), R('offline', 'benjis-ci'), R('online', 'x'), R('online', 'x', 'benjis-ci')]), 2));
+
+test('boundary: healthy 1 -> 2 while flipped, var ubuntu-latest -> no flip back', () => {
+  const r = decide({ state: st({ healthy: 1, flipped: true }), online: 1, currentVar: HOSTED, now: NOW });
+  assert.equal(r.state.healthy, 2);
+  assert.equal(r.state.flipped, true);
+  assert.deepEqual(r.actions, []);
+});
+
+test('boundary: misses 2 -> 3, lastAlert 1h ago -> no Slack, lastAlert unchanged', () => {
+  const r = decide({ state: st({ misses: 2, flipped: true, lastAlert: NOW - H }), online: 0, currentVar: HOSTED, now: NOW });
+  assert.equal(r.state.misses, 3);
+  assert.deepEqual(slacks(r), []);
+  assert.equal(r.state.lastAlert, NOW - H);
+});

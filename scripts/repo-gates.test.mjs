@@ -33,8 +33,18 @@ test('health.yml: schedule */5, dispatch dry_run boolean default false, concurre
   assert.match(t, /name:\s*Evaluate runners\s*$/m);
 });
 
-test('keepalive.yml: monthly cron, workflow_dispatch, enable API, no git push/commit', () => {
+test('keepalive.yml: monthly cron, workflow_dispatch, enable API for both workflows, Sentry + Slack wiring, no git push/commit', () => {
   const t = read(`${WF}/keepalive.yml`);
+  assert.match(t, /cron:\s*['"][^'"]+\s+[^'"]+\s+\d+\s+\*\s+\*['"]/, 'monthly cron: fixed day-of-month');
+  assert.match(t, /CAPTURE_ROUTE:\s*keepalive|route:\s*keepalive/);
+  assert.match(t, /SENTRY_DSN/);
+  assert.match(t, /failure\(\)/);
+  assert.match(t, /SLACK_FAILOVER_WEBHOOK/);
+  const code = ['keepalive.mjs', ...(readdirSync(join(ROOT, 'scripts')))].filter((f, i, a) => a.indexOf(f) === i && /\.mjs$/.test(f) && !/test/.test(f)).map((f) => read(`scripts/${f}`)).join('\n') + t;
+  assert.match(code, /actions\/workflows\/[^\n]*\/enable/);
+  assert.match(code, /method:\s*['"]PUT['"]|-X PUT/);
+  assert.match(code, /health\.yml/);
+  assert.match(code, /keepalive\.yml/);
   assert.match(t, /cron:/);
   assert.match(t, /workflow_dispatch:/);
   assert.match(t, /^permissions:\s*\{\}\s*$/m);
@@ -45,11 +55,18 @@ test('keepalive.yml: monthly cron, workflow_dispatch, enable API, no git push/co
 test('every workflow job referencing secrets. declares environment: failover', () => {
   const files = existsSync(join(ROOT, WF)) ? readdirSync(join(ROOT, WF)).filter((f) => /\.ya?ml$/.test(f)) : [];
   assert.ok(files.length >= 3, 'expected the three workflows');
+  let secretJobs = 0;
   for (const f of files) {
-    for (const job of jobsOf(read(`${WF}/${f}`))) {
-      if (/secrets\./.test(job)) assert.match(job, /environment:\s*failover\b/, `${f}: job uses secrets without environment: failover`);
+    const jobs = jobsOf(read(`${WF}/${f}`));
+    assert.ok(jobs.length > 0, `${f}: parser found no jobs (check would be vacuous)`);
+    for (const job of jobs) {
+      if (/secrets\./.test(job)) { secretJobs += 1; assert.match(job, /environment:\s*failover\b/, `${f}: job uses secrets without environment: failover`); }
     }
   }
+  assert.ok(secretJobs >= 2, 'health and keepalive jobs read secrets');
+  const evalJob = jobsOf(read(`${WF}/health.yml`)).find((j) => /name:\s*Evaluate runners\s*$/m.test(j));
+  assert.ok(evalJob, 'Evaluate runners step must be inside a job of health.yml');
+  assert.match(evalJob, /environment:\s*failover\b/);
 });
 
 test('no webhook URL or private key material anywhere in tracked-style files', () => {
@@ -65,11 +82,39 @@ test('no webhook URL or private key material anywhere in tracked-style files', (
   }
 });
 
-test('README documents permissions, environment, keep-alive, state, log contract, re-run result', () => {
+const section = (md, titleRe) => {
+  const parts = md.split(/^(?=#{1,3} )/m);
+  const s = parts.find((p) => titleRe.test(p.split('\n')[0]));
+  assert.ok(s, `README section ${titleRe} missing`);
+  return s;
+};
+
+test('README permissions section lists the exact permissions from the runbook', () => {
+  const s = section(read('README.md'), /permission/i);
+  assert.match(s, /Self-hosted runners[^\n]*read/i);
+  assert.match(s, /Variables[^\n]*read[^\n]*write/i);
+  assert.match(s, /scheduler[^\n]*benjis-quoting-tool[^\n]*Actions[^\n]*write|Actions[^\n]*write[^\n]*scheduler[^\n]*benjis-quoting-tool/i);
+  assert.match(s, /(this repo|ci-runner-health)[^\n]*Variables[^\n]*write[^\n]*Actions[^\n]*write/i);
+  assert.match(s, /operator[^\n]*confirm|confirm[^\n]*operator/i, 'marked line for operator to confirm exact keys');
+});
+
+test('README: failover environment, keep-alive (enable API, no commits), state shape, log contract sections', () => {
   const r = read('README.md');
-  for (const re of [/Self-hosted runners/i, /Variables/, /Actions/, /`failover`/, /enable/i, /no commits/i, /HEALTH_STATE/, /misses/, /lastAlert/, /log contract/i, /result: pending/]) {
-    assert.match(r, re, `README missing ${re}`);
-  }
+  assert.match(section(r, /failover/i), /HEALTH_APP_ID[\s\S]*HEALTH_APP_PRIVATE_KEY[\s\S]*SLACK_FAILOVER_WEBHOOK[\s\S]*SENTRY_DSN|branch `?main`?/);
+  const ka = section(r, /keep-?alive/i);
+  assert.match(ka, /actions\/workflows\/[^\n]*enable/);
+  assert.match(ka, /no commits/i);
+  const state = section(r, /state/i);
+  assert.ok(state.includes('{"misses":0,"healthy":0,"flipped":false,"lastAlert":null}'));
+  const lc = section(r, /log contract/i);
+  assert.ok(lc.includes('^(online|misses|healthy|decision|flipped|dry_run)=[A-Za-z0-9_.-]+$'));
+  for (const d of ['none', 'flip_to_hosted', 'flip_back', 'alert', 'api_error']) assert.ok(lc.includes(d), `decision value ${d}`);
+});
+
+test('README re-run section carries "result: pending" and describes the dispatch fallback', () => {
+  const s = section(read('README.md'), /re-?queue|re-?run/i);
+  assert.match(s, /result: pending/);
+  assert.match(s, /dispatch/i);
 });
 
 test('capture is wired: workflows post Slack on failure using the existing SLACK_FAILOVER_WEBHOOK only', () => {
