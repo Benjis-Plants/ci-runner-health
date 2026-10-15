@@ -1,4 +1,140 @@
-// STUB — replaced by the implementer. Contract is encoded in scripts/run.test.mjs.
-export async function evaluate({ client, dryRun, now, log, captureError }) {
-  throw new Error('NotImplemented');
+// Runner: reads fleet state, applies decide(), writes variables, alerts, re-queues.
+import { decide } from './decide.mjs';
+import { captureError as defaultCapture } from './report.mjs';
+
+const REQUEUE_REPOS = ['scheduler', 'benjis-quoting-tool'];
+const MIN_AGE_MS = 5 * 60_000;
+const CAP = 50;
+
+function parseCurrent(raw) {
+  try {
+    const v = JSON.parse(raw);
+    return v === 'benjis-ci' || v === 'ubuntu-latest' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+async function requeue(client, now) {
+  for (const repo of REQUEUE_REPOS) {
+    const runs = (await client.listQueuedRuns(repo))
+      .filter((r) => now.getTime() - Date.parse(r.created_at) > MIN_AGE_MS)
+      .slice(0, CAP);
+    for (const r of runs) {
+      await client.cancelRun(repo, r.id);
+      await client.rerunRun(repo, r.id);
+    }
+  }
+}
+
+export async function evaluate({ client, dryRun = false, now = new Date(), log = console.log, captureError = defaultCapture }) {
+  let route = 'health-check';
+  try {
+    const [rawState, rawCurrent, runners] = await Promise.all([
+      client.getRepoVariable('HEALTH_STATE'),
+      client.getOrgVariable('CI_RUNNER_JSON'),
+      client.listRunners(),
+    ]);
+    const current = rawCurrent == null ? null : parseCurrent(rawCurrent);
+    const online = runners.filter(
+      (r) => r.status === 'online' && (r.labels || []).some((l) => l.name === 'benjis-ci'),
+    ).length;
+    const d = decide({ state: rawState, online, current, now });
+
+    log(`online=${online}`);
+    log(`misses=${d.state.misses}`);
+    log(`healthy=${d.state.healthy}`);
+    log(`decision=${d.decision}`);
+    log(`flipped=${d.state.flipped}`);
+    log(`dry_run=${dryRun}`);
+    if (dryRun) return d;
+
+    if (d.writeVar) await client.setOrgVariable('CI_RUNNER_JSON', d.writeVar);
+    await client.setRepoVariable('HEALTH_STATE', JSON.stringify(d.state));
+    if (d.alert) {
+      await client.postSlack(
+        d.decision === 'flip_hosted'
+          ? 'CI runners unhealthy: failed over to GitHub-hosted runners.'
+          : 'CI runners still unhealthy (reminder).',
+      );
+    }
+
+    if (online < 1 && (d.decision === 'flip_hosted' || current === 'ubuntu-latest')) {
+      route = 'requeue';
+      await requeue(client, now);
+    }
+    return d;
+  } catch (err) {
+    if (!dryRun) {
+      try { await client.postSlack(`ci-runner-health step failed (route: ${route}). See workflow run.`); } catch { /* best effort */ }
+    }
+    try { await captureError(err, { route, env: process.env, fetch: globalThis.fetch }); } catch { /* best effort */ }
+    throw err;
+  }
+}
+
+function realClient(env) {
+  const owner = env.GITHUB_REPOSITORY_OWNER;
+  const repo = env.GITHUB_REPOSITORY.split('/')[1];
+  const api = 'https://api.github.com';
+  const headers = {
+    Authorization: `Bearer ${env.HEALTH_TOKEN}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  const call = async (method, path, body, okCodes = []) => {
+    const res = await fetch(`${api}${path}`, {
+      method,
+      headers: { ...headers, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok && !okCodes.includes(res.status)) throw new Error(`GitHub API ${method} failed: ${res.status}`);
+    return res;
+  };
+  const getVar = async (base, name) => {
+    const res = await call('GET', `${base}/${name}`, null, [404]);
+    return res.status === 404 ? null : (await res.json()).value;
+  };
+  const setVar = async (base, name, value) => {
+    const res = await call('PATCH', `${base}/${name}`, { name, value }, [404]);
+    if (res.status === 404) await call('POST', base, { name, value });
+  };
+  return {
+    getRepoVariable: (n) => getVar(`/repos/${owner}/${repo}/actions/variables`, n),
+    getOrgVariable: (n) => getVar(`/orgs/${owner}/actions/variables`, n),
+    setRepoVariable: (n, v) => setVar(`/repos/${owner}/${repo}/actions/variables`, n, v),
+    setOrgVariable: (n, v) => setVar(`/orgs/${owner}/actions/variables`, n, v),
+    listRunners: async () => {
+      const out = [];
+      for (let page = 1; page <= 10; page++) {
+        const j = await (await call('GET', `/orgs/${owner}/actions/runners?per_page=100&page=${page}`)).json();
+        out.push(...j.runners);
+        if (j.runners.length < 100) break;
+      }
+      return out;
+    },
+    listQueuedRuns: async (r) =>
+      (await (await call('GET', `/repos/${owner}/${r}/actions/runs?status=queued&per_page=100`)).json()).workflow_runs,
+    cancelRun: (r, id) => call('POST', `/repos/${owner}/${r}/actions/runs/${id}/cancel`),
+    rerunRun: (r, id) => call('POST', `/repos/${owner}/${r}/actions/runs/${id}/rerun`),
+    postSlack: async (text) => {
+      const res = await fetch(env.SLACK_FAILOVER_WEBHOOK, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error(`Slack post failed: ${res.status}`);
+    },
+  };
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  evaluate({
+    client: realClient(process.env),
+    dryRun: process.env.DRY_RUN === 'true',
+    now: new Date(),
+    log: (l) => process.stdout.write(`${l}\n`),
+  }).catch(() => {
+    process.exitCode = 1;
+  });
 }
