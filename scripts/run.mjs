@@ -16,11 +16,18 @@ function parseCurrent(raw) {
 }
 
 const RERUN_TRIES = 3;
+// Job timeout is 10 min; stop starting cancel/re-run pairs well inside it.
+const REQUEUE_DEADLINE_MS = 7 * 60_000;
+// Worst case for one pair: cancel + 3 re-run attempts (15s fetch timeout each) + 6s backoff.
+const PAIR_BUDGET_MS = 60_000;
 const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Cancel then re-run each stuck run. A failed re-run is retried with backoff; a run
 // that still fails is logged and counted. One repo erroring never skips the other.
-async function requeue(client, now, { sleep }) {
+async function requeue(client, now, { sleep, clock }) {
+  const start = clock();
+  let deferred = 0;
+  const ref = (repo, id) => (client.runUrl ? client.runUrl(repo, id) : `${repo}#${id}`);
   const failed = [];
   const errs = [];
   const warn = (m) => process.stderr.write(`${m}\n`);
@@ -31,11 +38,17 @@ async function requeue(client, now, { sleep }) {
         .filter((r) => now.getTime() - Date.parse(r.created_at) > MIN_AGE_MS)
         .slice(0, CAP);
       for (const r of runs) {
+        // Never cancel unless there is time left to issue its re-run; the run stays
+        // queued and the next scheduled invocation picks it up.
+        if (clock() - start + PAIR_BUDGET_MS > REQUEUE_DEADLINE_MS) {
+          deferred++;
+          continue;
+        }
         try {
           await client.cancelRun(repo, r.id);
         } catch (e) {
           errs.push(e);
-          failed.push(`${repo}#${r.id}`);
+          failed.push(ref(repo, r.id));
           warn(`requeue failed (cancel): ${repo} run ${r.id}`);
           continue;
         }
@@ -51,7 +64,7 @@ async function requeue(client, now, { sleep }) {
         if (ok) requeued++;
         else {
           errs.push(lastErr);
-          failed.push(`${repo}#${r.id}`);
+          failed.push(ref(repo, r.id));
           warn(`requeue failed (rerun): ${repo} run ${r.id}`);
         }
       }
@@ -61,11 +74,11 @@ async function requeue(client, now, { sleep }) {
       warn(`requeue failed (list): ${repo}`);
     }
   }
-  warn(`requeued=${requeued} failed=${failed.length}`);
+  warn(`requeued=${requeued} failed=${failed.length} deferred=${deferred}`);
   return { failed, firstErr: errs[0] };
 }
 
-export async function evaluate({ client, dryRun = false, now = new Date(), log = console.log, captureError = defaultCapture, sleep = defaultSleep }) {
+export async function evaluate({ client, dryRun = false, now = new Date(), log = console.log, captureError = defaultCapture, sleep = defaultSleep, clock = Date.now }) {
   let route = 'health-check';
   try {
     const [rawState, rawCurrent, runners] = await Promise.all([
@@ -103,7 +116,7 @@ export async function evaluate({ client, dryRun = false, now = new Date(), log =
     let firstErr;
     if (online < 1 && (d.decision === 'flip_hosted' || current === 'ubuntu-latest')) {
       route = 'requeue';
-      ({ failed, firstErr } = await requeue(client, now, { sleep }));
+      ({ failed, firstErr } = await requeue(client, now, { sleep, clock }));
       if (!failed.length) route = 'health-check';
     }
     let slackErr = null;
@@ -176,6 +189,7 @@ function realClient(env) {
     },
     listQueuedRuns: async (r) =>
       (await (await call('GET', `/repos/${owner}/${r}/actions/runs?status=queued&per_page=100`)).json()).workflow_runs,
+    runUrl: (r, id) => `https://github.com/${owner}/${r}/actions/runs/${id}`,
     cancelRun: (r, id) => call('POST', `/repos/${owner}/${r}/actions/runs/${id}/cancel`),
     rerunRun: (r, id) => call('POST', `/repos/${owner}/${r}/actions/runs/${id}/rerun`),
     postSlack: async (text) => {
