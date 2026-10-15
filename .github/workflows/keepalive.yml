@@ -13,7 +13,9 @@ jobs:
     environment: failover
     permissions:
       actions: write
+      contents: read
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Re-enable workflows
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -32,3 +34,9 @@ jobs:
           curl -fsS -X POST -H 'Content-Type: application/json' \
             -d '{"text":"ci-runner-health keepalive failed (route: keepalive). See workflow run."}' \
             "$SLACK_FAILOVER_WEBHOOK"
+      - name: Capture failure to Sentry
+        if: failure()
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: node scripts/keepalive-capture.mjs
