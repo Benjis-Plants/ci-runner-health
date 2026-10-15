@@ -1,0 +1,47 @@
+name: health
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Read-only run (no writes)
+        type: boolean
+        default: false
+concurrency:
+  group: ci-runner-health
+  cancel-in-progress: false
+permissions: {}
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    environment: failover
+    steps:
+      - name: Fetch scripts
+        run: |
+          git init -q .
+          git fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+      - name: Mint token
+        id: mint
+        env:
+          HEALTH_APP_ID: ${{ secrets.HEALTH_APP_ID }}
+          HEALTH_APP_PRIVATE_KEY: ${{ secrets.HEALTH_APP_PRIVATE_KEY }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          CAPTURE_ROUTE: health
+        run: node scripts/mint-token.mjs
+      - name: Evaluate runners
+        env:
+          GH_TOKEN: ${{ steps.mint.outputs.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SLACK_FAILOVER_WEBHOOK: ${{ secrets.SLACK_FAILOVER_WEBHOOK }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: node scripts/evaluate.mjs
+      - name: Alert on failure
+        if: failure()
+        env:
+          SLACK_FAILOVER_WEBHOOK: ${{ secrets.SLACK_FAILOVER_WEBHOOK }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          [ -n "$SLACK_FAILOVER_WEBHOOK" ] && curl -sS -o /dev/null -X POST -H 'content-type: application/json' \
+            --data '{"text":"ci-runner-health workflow failed"}' "$SLACK_FAILOVER_WEBHOOK" || true

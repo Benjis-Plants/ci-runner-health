@@ -1,0 +1,36 @@
+name: keepalive
+on:
+  schedule:
+    - cron: '17 3 1 * *'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    environment: failover
+    steps:
+      - name: Fetch scripts
+        run: |
+          git init -q .
+          git fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+      - name: Mint token
+        id: mint
+        env:
+          HEALTH_APP_ID: ${{ secrets.HEALTH_APP_ID }}
+          HEALTH_APP_PRIVATE_KEY: ${{ secrets.HEALTH_APP_PRIVATE_KEY }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          CAPTURE_ROUTE: keepalive
+        run: node scripts/mint-token.mjs
+      - name: Call enable-workflow API
+        env:
+          GH_TOKEN: ${{ steps.mint.outputs.token }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: node scripts/keepalive.mjs
+      - name: Alert on failure
+        if: failure()
+        env:
+          SLACK_FAILOVER_WEBHOOK: ${{ secrets.SLACK_FAILOVER_WEBHOOK }}
+        run: |
+          [ -n "$SLACK_FAILOVER_WEBHOOK" ] && curl -sS -o /dev/null -X POST -H 'content-type: application/json' \
+            --data '{"text":"ci-runner-health keepalive failed"}' "$SLACK_FAILOVER_WEBHOOK" || true
