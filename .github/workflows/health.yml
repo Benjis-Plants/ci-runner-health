@@ -1,0 +1,41 @@
+name: Runner health
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print the decision only; make no write call
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ci-runner-health
+  cancel-in-progress: false
+
+jobs:
+  failover:
+    runs-on: ubuntu-latest
+    environment: failover
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ secrets.HEALTH_APP_ID }}
+          private-key: ${{ secrets.HEALTH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      - name: Evaluate runners
+        env:
+          HEALTH_TOKEN: ${{ steps.app.outputs.token }}
+          SLACK_FAILOVER_WEBHOOK: ${{ secrets.SLACK_FAILOVER_WEBHOOK }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: node scripts/run.mjs
