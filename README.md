@@ -23,12 +23,13 @@ optional `SENTRY_DSN` (capture is a silent no-op until set). Only the job declar
 
 ## GitHub App `benjis-ci-health` (id 5337160) permissions
 
-Exact keys are recorded by the operator from the infra #206 Step 7 runbook:
+Exact permission keys:
 
-- Organization: Self-hosted runners — read
-- Organization: Variables — read and write
-- Repository `scheduler` and `benjis-quoting-tool`: Actions — write
-- Repository `ci-runner-health`: Variables — write
+- `organization_self_hosted_runners`: read
+- `organization_actions_variables`: write
+- `actions`: write, on repositories `scheduler` and `benjis-quoting-tool`
+- `actions_variables`: write, on this repository (`ci-runner-health`)
+- `metadata`: read
 
 ## Keep-alive
 
@@ -39,10 +40,8 @@ GitHub disables scheduled workflows after 60 days without repo activity.
 
 ## Re-run test result
 
-Open question to be recorded by the operator: does a re-run of a cancelled queued run
-re-evaluate `vars` (i.e. does the re-run land on `ubuntu-latest`)?
-
-Result: _not yet tested — operator to record here._
+Unverified: whether a re-run of a cancelled queued run re-evaluates `vars` (i.e. lands
+on `ubuntu-latest`). The behaviour below does not depend on the answer.
 
 Fallback if re-run does not re-evaluate `vars`: `workflow_dispatch` a fresh run of
 the same workflow on the same ref (only for workflows that declare `workflow_dispatch`);
