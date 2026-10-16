@@ -25,11 +25,11 @@ optional `SENTRY_DSN` (capture is a silent no-op until set). Only the job declar
 
 Exact permission keys:
 
-- `organization_self_hosted_runners`: read
-- `organization_actions_variables`: write
-- `actions`: write, on repositories `scheduler` and `benjis-quoting-tool`
-- `actions_variables`: write, on this repository (`ci-runner-health`)
-- `metadata`: read
+- Self-hosted runners (org): `organization_self_hosted_runners` read
+- Variables (org): `organization_actions_variables` write
+- Actions: `actions` write, on repositories `scheduler` and `benjis-quoting-tool`
+- Variables (repo): `actions_variables` write, on this repository (`ci-runner-health`)
+- Metadata: `metadata` read
 
 ## Keep-alive
 
